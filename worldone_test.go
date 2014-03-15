@@ -1,4 +1,4 @@
-package worldone
+package main
 
 import (
 	"testing"
