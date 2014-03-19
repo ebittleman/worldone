@@ -1,17 +1,32 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
+
+	"code.google.com/p/go.net/websocket"
 )
 
 func Add(a int, b int) int {
 	return a + b
 }
+
+type socket struct {
+	io.ReadWriter
+	done chan bool
+}
+
+func (s *socket) Close() error {
+	close(s.done)
+	return nil
+}
+
+var listenAddr = "localhost:8080"
 
 func main() {
 	// var i int
@@ -20,7 +35,18 @@ func main() {
 
 	logger := log.New(os.Stderr, "helloword", log.Ldate|log.Ltime)
 
-	ln, err := net.Listen("tcp", ":8080")
+	go telnetServer(logger)
+
+	http.HandleFunc("/", rootHandler)
+	http.Handle("/socket", websocket.Handler(socketHandler))
+	err := http.ListenAndServe(listenAddr, nil)
+	if err != nil {
+		logger.Fatal(err)
+	}
+}
+
+func telnetServer(logger *log.Logger) {
+	ln, err := net.Listen("tcp", ":4000")
 	if err != nil {
 		panic(err)
 	}
@@ -30,51 +56,76 @@ func main() {
 			logger.Fatal(err)
 			continue
 		}
-		com := &Comm{conn, make(chan io.ReadWriteCloser)}
-		go handleConnection(com)
-		com.out <- os.Stderr
+		go match(conn)
 	}
 }
 
-type Comm struct {
-	in  io.ReadWriteCloser
-	out chan io.ReadWriteCloser
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	rootTemplate.Execute(w, listenAddr)
 }
 
-func handleConnection(com *Comm) {
-	done := make(chan bool)
+var rootTemplate = template.Must(template.New("root").Parse(`
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<script>
+function onMessage(m){
+	div = document.createElement("div");
+	div.innerHTML = m.data;
+	input.appendChild(div)
+}
+function onClose(){
+	div = document.createElement("div");
+	div.innerHTML = "BYE!";
+	input.appendChild(div)
+}
+websocket = new WebSocket("ws://{{.}}/socket");
+websocket.onmessage = onMessage;
+websocket.onclose = onClose;
+</script>
+<body>
+<div id="input"></div><br/>
+<input type="text" id="ouput"/><button id="btn">Send</button>
+</body>
+</html>    
+</html>
+`))
 
-	output := <-com.out
-	input := com.in
+func socketHandler(ws *websocket.Conn) {
+	s := &socket{ws, make(chan bool)}
+	go match(s)
+	<-s.done
+}
 
-	sendFunc := func(input io.ReadWriteCloser, output io.Writer) {
+var partner = make(chan io.ReadWriteCloser)
 
-		defer input.Close()
-		reader := bufio.NewReader(input)
+func match(c io.ReadWriteCloser) {
+	logger := log.New(os.Stderr, "helloword", log.Ldate|log.Ltime)
+	fmt.Fprint(c, "Waiting ...")
+	select {
+	case partner <- c:
+	case p := <-partner:
+		chat(p, c, logger)
+	}
+}
 
-		defer func() {
-			done <- true
-		}()
+func chat(a, b io.ReadWriteCloser, logger *log.Logger) {
+	fmt.Fprintln(a, "Welcome")
+	fmt.Fprintln(b, "Welcome")
+	errc := make(chan error, 1)
+	go cp(a, b, errc)
+	go cp(b, a, errc)
 
-		for {
-			line, err := reader.ReadString('\n')
-
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-
-			_, err = output.Write([]byte(line))
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-			input.Write([]byte("thanks\n"))
-		}
+	if err := <-errc; err != nil {
+		logger.Println(err)
 	}
 
-	go sendFunc(input, output)
-	<-done
-	close(done)
-	fmt.Println("All Closed Up Later")
+	a.Close()
+	b.Close()
+}
+
+func cp(w io.Writer, r io.Reader, errc chan<- error) {
+	_, err := io.Copy(w, r)
+	errc <- err
 }
